@@ -2,6 +2,16 @@
 
 这是一个用于在 Codex App 里通过中转 API 生成图片的 Skill。
 
+## 安装方式
+
+在 Codex App 里直接输入下面一句话即可安装这个 Skill：
+
+```text
+帮我从 GitHub 安装这个 Skill，仓库是 https://github.com/SuhaifengEric/relay-image2，Skill 路径是仓库根目录。
+```
+
+安装完成后，重启 Codex App 让新 Skill 生效。
+
 ## 使用方式
 
 在 Codex App 对话框里直接输入：
