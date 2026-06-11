@@ -165,6 +165,31 @@ def find_status(obj):
     return None
 
 
+def task_endpoints(task_id: str, custom_endpoints: list[str] | None = None) -> list[str]:
+    encoded = urllib.parse.quote(task_id, safe="")
+    defaults = [
+        "/v1/tasks/{task_id}",
+        "/v1/images/tasks/{task_id}",
+        "/v1/images/generations/{task_id}",
+    ]
+    seen = set()
+    endpoints = []
+    for template in (custom_endpoints or []) + defaults:
+        endpoint = template.strip()
+        if not endpoint:
+            continue
+        if "{task_id}" in endpoint:
+            endpoint = endpoint.replace("{task_id}", encoded)
+        elif endpoint.endswith("/"):
+            endpoint = endpoint + encoded
+        elif task_id not in endpoint:
+            endpoint = endpoint.rstrip("/") + "/" + encoded
+        if endpoint not in seen:
+            seen.add(endpoint)
+            endpoints.append(endpoint)
+    return endpoints
+
+
 def download_url(url: str, timeout: int) -> tuple[str, bytes]:
     req = urllib.request.Request(
         url,
@@ -177,14 +202,14 @@ def download_url(url: str, timeout: int) -> tuple[str, bytes]:
         return resp.headers.get("Content-Type", ""), resp.read()
 
 
-def save_image_item(output_dir: Path, filename: str | None, prompt: str, item: dict, output_format: str, timeout: int, source: str, size: str, size_source: str) -> Path:
+def save_image_item(output_dir: Path, filename: str | None, prompt: str, item: dict, output_format: str, timeout: int, source: str, resolution: str, resolution_source: str, size: str, size_source: str) -> Path:
     if item.get("b64_json"):
         value = item["b64_json"]
         if isinstance(value, str) and value.startswith("data:image"):
             value = value.split(",", 1)[1]
         image_bytes = base64.b64decode(value)
         path = save_bytes(output_dir, filename, prompt, image_bytes, output_format)
-        print(json.dumps({"path": str(path), "source": source, "size": size, "size_source": size_source}, ensure_ascii=False))
+        print(json.dumps({"path": str(path), "source": source, "resolution": resolution, "resolution_source": resolution_source, "size": size, "size_source": size_source}, ensure_ascii=False))
         return path
 
     if item.get("url"):
@@ -193,19 +218,15 @@ def save_image_item(output_dir: Path, filename: str | None, prompt: str, item: d
             raise RuntimeError(f"Downloaded URL is not an image. Content-Type: {img_type or 'unknown'}")
         ext = ext_from_content_type(img_type, output_format)
         path = save_bytes(output_dir, filename, prompt, image_bytes, ext)
-        print(json.dumps({"path": str(path), "source": source, "size": size, "size_source": size_source}, ensure_ascii=False))
+        print(json.dumps({"path": str(path), "source": source, "resolution": resolution, "resolution_source": resolution_source, "size": size, "size_source": size_source}, ensure_ascii=False))
         return path
 
     raise RuntimeError(f"No image field found. Item keys: {list(item.keys())}")
 
 
-def poll_task(base_url: str, key: str, task_id: str, output_dir: Path, filename: str | None, prompt: str, output_format: str, timeout: int, poll_timeout: int, poll_interval: float, size: str, size_source: str) -> Path:
+def poll_task(base_url: str, key: str, task_id: str, output_dir: Path, filename: str | None, prompt: str, output_format: str, timeout: int, poll_timeout: int, poll_interval: float, resolution: str, resolution_source: str, size: str, size_source: str, task_endpoint_templates: list[str] | None = None) -> Path:
     deadline = time.time() + poll_timeout
-    endpoints = [
-        f"/v1/tasks/{urllib.parse.quote(task_id, safe='')}",
-        f"/v1/images/tasks/{urllib.parse.quote(task_id, safe='')}",
-        f"/v1/images/generations/{urllib.parse.quote(task_id, safe='')}",
-    ]
+    endpoints = task_endpoints(task_id, task_endpoint_templates)
     last_status = None
     last_error = None
 
@@ -221,14 +242,14 @@ def poll_task(base_url: str, key: str, task_id: str, output_dir: Path, filename:
             if content_type.startswith("image/"):
                 ext = ext_from_content_type(content_type, output_format)
                 path = save_bytes(output_dir, filename, prompt, data, ext)
-                print(json.dumps({"path": str(path), "source": "task-direct-bytes", "task_id": task_id, "size": size, "size_source": size_source}, ensure_ascii=False))
+                print(json.dumps({"path": str(path), "source": "task-direct-bytes", "task_id": task_id, "resolution": resolution, "resolution_source": resolution_source, "size": size, "size_source": size_source}, ensure_ascii=False))
                 return path
 
             text = data.decode("utf-8", errors="replace")
             obj = json.loads(text)
             item = find_image(obj)
             if item:
-                return save_image_item(output_dir, filename, prompt, item, output_format, timeout, "task-result", size, size_source)
+                return save_image_item(output_dir, filename, prompt, item, output_format, timeout, "task-result", resolution, resolution_source, size, size_source)
 
             status = find_status(obj)
             if status and status != last_status:
@@ -243,29 +264,51 @@ def poll_task(base_url: str, key: str, task_id: str, output_dir: Path, filename:
     raise RuntimeError(f"Image task did not finish within {poll_timeout}s: {task_id}{detail}")
 
 
-def infer_resolution(prompt: str, resolution: str, size: str | None) -> tuple[str, str]:
-    if size:
-        return size, "explicit-size"
+def infer_generation_params(prompt: str, resolution: str, size: str | None) -> tuple[str, str, str, str]:
     normalized = prompt.lower()
     compact = re.sub(r"\s+", "", normalized)
     if resolution != "auto":
-        return resolution_to_size(resolution), f"explicit-{resolution}"
-    if re.search(r"(^|[^0-9])4\s*k([^a-z0-9]|$)", normalized) or any(token in compact for token in ["4k", "4096", "四千", "超高清", "超清", "最高分辨率", "最大分辨率"]):
-        return "4096x4096", "prompt-4k"
-    if re.search(r"(^|[^0-9])2\s*k([^a-z0-9]|$)", normalized) or any(token in compact for token in ["2k", "2048", "两千", "高清", "高分辨率"]):
-        return "2048x2048", "prompt-2k"
-    if re.search(r"(^|[^0-9])1\s*k([^a-z0-9]|$)", normalized) or any(token in compact for token in ["1k", "1024", "一千", "默认分辨率", "普通分辨率"]):
-        return "1024x1024", "prompt-1k"
-    return "1024x1024", "default-1k"
+        resolved_resolution = resolution
+        resolution_source = f"explicit-{resolution}"
+    elif re.search(r"(^|[^0-9])4\s*k([^a-z0-9]|$)", normalized) or any(token in compact for token in ["4k", "4096", "四千", "超高清", "超清", "最高分辨率", "最大分辨率"]):
+        resolved_resolution = "4k"
+        resolution_source = "prompt-4k"
+    elif re.search(r"(^|[^0-9])2\s*k([^a-z0-9]|$)", normalized) or any(token in compact for token in ["2k", "2048", "两千", "高清", "高分辨率"]):
+        resolved_resolution = "2k"
+        resolution_source = "prompt-2k"
+    elif re.search(r"(^|[^0-9])1\s*k([^a-z0-9]|$)", normalized) or any(token in compact for token in ["1k", "1024", "一千", "默认分辨率", "普通分辨率"]):
+        resolved_resolution = "1k"
+        resolution_source = "prompt-1k"
+    else:
+        resolved_resolution = "1k"
+        resolution_source = "default-resolution"
+
+    resolved_size = size or "1:1"
+    size_source = "explicit-size" if size else "default-size"
+    return resolved_resolution, resolution_source, resolved_size, size_source
 
 
-def resolution_to_size(resolution: str) -> str:
-    mapping = {
-        "1k": "1024x1024",
-        "2k": "2048x2048",
-        "4k": "4096x4096",
+def build_payload(mode: str, model: str, prompt: str, resolution: str, size: str) -> dict:
+    if mode == "responses":
+        return {
+            "model": model,
+            "input": prompt,
+            "tools": [{"type": "image_generation", "resolution": resolution, "size": size}],
+            "tool_choice": {"type": "image_generation"},
+        }
+    return {
+        "model": model,
+        "prompt": prompt,
+        "resolution": resolution,
+        "size": size,
+        "response_format": "b64_json",
     }
-    return mapping[resolution]
+
+
+def split_csv(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
 
 
 def main() -> int:
@@ -277,20 +320,42 @@ def main() -> int:
     parser.add_argument("--size")
     parser.add_argument("--output-format", default="png")
     parser.add_argument("--model")
-    parser.add_argument("--responses-model", default=os.environ.get("RELAY_IMAGE2_RESPONSES_MODEL") or os.environ.get("RELAY_IMAGEGEN_RESPONSES_MODEL") or os.environ.get("SUB2API_RESPONSES_MODEL", "gpt-5.5"))
+    parser.add_argument("--responses-model", default=os.environ.get("RELAY_IMAGE2_RESPONSES_MODEL") or os.environ.get("RELAY_IMAGEGEN_RESPONSES_MODEL") or os.environ.get("SUB2API_RESPONSES_MODEL", ""))
     parser.add_argument("--image-model", default=os.environ.get("RELAY_IMAGE2_IMAGE_MODEL") or os.environ.get("RELAY_IMAGEGEN_IMAGE_MODEL") or os.environ.get("SUB2API_IMAGE_MODEL", "gpt-image-2"))
     parser.add_argument("--endpoint")
-    parser.add_argument("--mode", choices=["auto", "responses", "images"], default="auto")
+    parser.add_argument("--mode", choices=["auto", "responses", "images"], default="images")
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--poll-timeout", type=int, default=240)
     parser.add_argument("--poll-interval", type=float, default=5)
+    parser.add_argument("--task-endpoint", action="append", default=[], help="Task polling endpoint template. Use {task_id}. Can be repeated.")
+    parser.add_argument("--confirmed", action="store_true", help="Required after the user confirms prompt, resolution, and size.")
     args = parser.parse_args()
+
+    resolution, resolution_source, size, size_source = infer_generation_params(args.prompt, args.resolution, args.size)
+    output_dir = Path(args.output_dir)
+
+    if not args.confirmed:
+        print(json.dumps({
+            "needs_confirmation": True,
+            "prompt": args.prompt,
+            "resolution": resolution,
+            "resolution_source": resolution_source,
+            "size": size,
+            "size_source": size_source,
+            "message": "Confirm prompt, resolution, and size before rerunning with --confirmed.",
+        }, ensure_ascii=False))
+        return 3
 
     load_env_file(Path.home() / ".codex" / "relay-image2.env")
     load_env_file(Path.home() / ".codex" / "relay-imagegen.env")
     load_env_file(Path.home() / ".codex" / "sub2api-image2.env")
     base_url = os.environ.get("RELAY_IMAGE2_BASE_URL") or os.environ.get("RELAY_IMAGEGEN_BASE_URL") or os.environ.get("SUB2API_BASE_URL")
     key = os.environ.get("RELAY_IMAGE2_KEY") or os.environ.get("RELAY_IMAGEGEN_KEY") or os.environ.get("SUB2API_KEY")
+    task_endpoint_templates = args.task_endpoint + split_csv(
+        os.environ.get("RELAY_IMAGE2_TASK_ENDPOINTS")
+        or os.environ.get("RELAY_IMAGEGEN_TASK_ENDPOINTS")
+        or os.environ.get("SUB2API_TASK_ENDPOINTS")
+    )
     if not base_url or not key:
         print(
             "Missing credentials. Set RELAY_IMAGE2_BASE_URL and RELAY_IMAGE2_KEY, "
@@ -299,46 +364,31 @@ def main() -> int:
         )
         return 2
 
-    size, size_source = infer_resolution(args.prompt, args.resolution, args.size)
-    output_dir = Path(args.output_dir)
-
     def run(mode: str) -> Path:
         endpoint = args.endpoint or ("/v1/responses" if mode == "responses" else "/v1/images/generations")
         url = resolve_url(base_url, endpoint)
         model = args.model or (args.responses_model if mode == "responses" else args.image_model)
-
-        if mode == "responses":
-            payload = {
-                "model": model,
-                "input": args.prompt,
-                "tools": [{"type": "image_generation", "size": size}],
-                "tool_choice": {"type": "image_generation"},
-            }
-        else:
-            payload = {
-                "model": model,
-                "prompt": args.prompt,
-                "size": size,
-                "response_format": "b64_json",
-            }
+        if mode == "responses" and not model:
+            raise RuntimeError("Responses mode requires --responses-model or RELAY_IMAGE2_RESPONSES_MODEL.")
+        payload = build_payload(mode, model, args.prompt, resolution, size)
 
         _, content_type, data = request_json(url, key, payload, args.timeout)
         if content_type.startswith("image/"):
             ext = ext_from_content_type(content_type, args.output_format)
             path = save_bytes(output_dir, args.filename, args.prompt, data, ext)
-            print(json.dumps({"path": str(path), "source": "direct-bytes", "mode": mode, "model": model, "size": size, "size_source": size_source}, ensure_ascii=False))
+            print(json.dumps({"path": str(path), "source": "direct-bytes", "mode": mode, "model": model, "resolution": resolution, "resolution_source": resolution_source, "size": size, "size_source": size_source}, ensure_ascii=False))
             return path
 
         text = data.decode("utf-8", errors="replace")
         obj = json.loads(text)
         item = find_image(obj)
         if item:
-            return save_image_item(output_dir, args.filename, args.prompt, item, args.output_format, args.timeout, f"{mode}-image", size, size_source)
+            return save_image_item(output_dir, args.filename, args.prompt, item, args.output_format, args.timeout, f"{mode}-image", resolution, resolution_source, size, size_source)
 
         task_id = find_task_id(obj)
         if task_id:
             print(json.dumps({"task_id": task_id, "mode": mode, "model": model}, ensure_ascii=False), file=sys.stderr)
-            return poll_task(base_url, key, task_id, output_dir, args.filename, args.prompt, args.output_format, args.timeout, args.poll_timeout, args.poll_interval, size, size_source)
+            return poll_task(base_url, key, task_id, output_dir, args.filename, args.prompt, args.output_format, args.timeout, args.poll_timeout, args.poll_interval, resolution, resolution_source, size, size_source, task_endpoint_templates)
 
         item = find_image_item(obj)
         if isinstance(item, dict):
@@ -346,17 +396,9 @@ def main() -> int:
         raise RuntimeError(f"Unexpected JSON shape. Top-level keys: {list(obj) if isinstance(obj, dict) else type(obj).__name__}")
 
     try:
-        if args.mode != "auto":
-            run(args.mode)
-            return 0
-
-        try:
-            run("responses")
-            return 0
-        except Exception as responses_exc:
-            print(f"Responses mode failed, falling back to images mode: {responses_exc}", file=sys.stderr)
-            run("images")
-            return 0
+        mode = "images" if args.mode == "auto" else args.mode
+        run(mode)
+        return 0
     except Exception as exc:
         print(str(exc), file=sys.stderr)
         return 1

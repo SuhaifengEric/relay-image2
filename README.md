@@ -26,7 +26,26 @@
 生图：生成一张方形产品海报，白色背景，中心是一只透明玻璃杯，商业摄影风格
 ```
 
-Codex 会根据提示词调用已配置的中转 API 生成图片，并把生成结果保存到本地后展示出来。
+Codex 会先整理并展示本次生图参数：提示词 `prompt`、分辨率 `resolution`、尺寸 `size`。你确认后，它才会调用已配置的中转 API 生成图片，并把生成结果保存到本地后展示出来。
+
+参数规则：
+
+- 默认走 direct images 路径，访问 `gpt-image-2`。
+- 如果你的中转站使用了不同的图片模型名，在 env 文件里配置 `RELAY_IMAGE2_IMAGE_MODEL`，不要改 Skill 文档。
+- 普通生图不需要访问 `gpt-5.5`。
+- `4k` 表示 `resolution=4k`，不是 `size=4096x4096`。
+- 如果没有指定尺寸，`size` 默认是 `1:1`。
+- 调用 API 或轮询任务出错时，Codex 会停止生成并直接说明问题，不会继续尝试其他生成路径。
+
+可选配置示例：
+
+```sh
+# 多数中转站可以不写，默认就是 gpt-image-2
+RELAY_IMAGE2_IMAGE_MODEL=gpt-image-2
+
+# 如果中转站返回 task_id，但查询任务的接口不同，可以配置轮询地址模板
+RELAY_IMAGE2_TASK_ENDPOINTS=/v1/tasks/{task_id},/v1/images/tasks/{task_id}
+```
 
 ## macOS 配置说明
 
